@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Serverless YouTube Trending Data ETL: S3 (raw -> clean) + Lambda + Glue + Athena.
+  Creates buckets, Lambda trigger on raw/, Glue DB/Crawler/Job, and an Athena WorkGroup.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: youtube-trending-etl
+    Description: Prefix for named resources.
+  RawBucketName:
+    Type: String
+    Description: Globally-unique name for the RAW S3 bucket (ingest).
+  CleanBucketName:
+    Type: String
+    Description: Globally-unique name for the CLEAN S3 bucket (processed/curated).
+  AthenaResultsBucketName:
+    Type: String
+    Description: Globally-unique name for Athena query results bucket.
+  CodeBucketName:
+    Type: String
+    Description: S3 bucket that stores your deployment artifacts (Lambda zip, Glue script).
+  LambdaCodeKey:
+    Type: String
+    Default: lambda/lambda_function.zip
+    Description: S3 key to the Lambda deployment package zip (in CodeBucketName).
+  GlueScriptKey:
+    Type: String
+    Default: glue/glue_job_etl.py
+    Description: S3 key to the Glue ETL script (in CodeBucketName).
+  GlueDatabaseName:
+    Type: String
+    Default: youtube_db
+  GlueCrawlerName:
+    Type: String
+    Default: youtube-clean-crawler
+  GlueJobName:
+    Type: String
+    Default: youtube-etl-job
+  AthenaWorkGroupName:
+    Type: String
+    Default: youtube-wg
+  RawPrefix:
+    Type: String
+    Default: raw/
+  CleanPrefix:
+    Type: String
+    Default: clean/
+  CrawlerScheduleExpression:
+    Type: String
+    Default: cron(0 * * * ? *) # every hour
+    Description: CloudWatch schedule for Glue crawler. Use 'cron(0 * * * ? *)' for hourly, 'cron(0 0 * * ? *)' for daily.
+
+Mappings: {}
+
+Resources:
+  # -----------------------------
+  # S3 Buckets
+  # -----------------------------
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref RawBucketName
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  CleanBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref CleanBucketName
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref AthenaResultsBucketName
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # -----------------------------
+  # IAM for Lambda
+  # -----------------------------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-lambda-s3-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RawRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${RawBucketName}
+                  - !Sub arn:aws:s3:::${RawBucketName}/${RawPrefix}*
+              - Sid: CleanWrite
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub arn:aws:s3:::${CleanBucketName}/${CleanPrefix}*
+              - Sid: GlueStartJobOptional
+                Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource: "*"
+
+  # -----------------------------
+  # Lambda Function
+  # -----------------------------
+  DataCleanLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-data-cleaner
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Timeout: 180
+      MemorySize: 512
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          CLEAN_BUCKET: !Ref CleanBucketName
+          CLEAN_PREFIX: !Ref CleanPrefix
+          RAW_BUCKET: !Ref RawBucketName
+          RAW_PREFIX: !Ref RawPrefix
+
+  # Permission for S3->Lambda invocation
+  LambdaInvokePermissionFromS3:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataCleanLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${RawBucketName}
+
+  # Configure S3 event to trigger Lambda on object create under raw/
+  RawBucketNotification:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref RawBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DataCleanLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref RawPrefix
+    DependsOn: LambdaInvokePermissionFromS3
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+
+  # -----------------------------
+  # IAM for Glue
+  # -----------------------------
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-glue-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-glue-s3-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${RawBucketName}
+                  - !Sub arn:aws:s3:::${RawBucketName}/${RawPrefix}*
+                  - !Sub arn:aws:s3:::${CleanBucketName}
+                  - !Sub arn:aws:s3:::${CleanBucketName}/${CleanPrefix}*
+                  - !Sub arn:aws:s3:::${CodeBucketName}
+                  - !Sub arn:aws:s3:::${CodeBucketName}/${GlueScriptKey}
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # -----------------------------
+  # Glue Data Catalog
+  # -----------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: !Sub "${ProjectName} Glue database"
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Ref GlueCrawlerName
+      Role: !GetAtt GlueRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      Description: !Sub "Crawler for ${CleanBucketName}/${CleanPrefix}"
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${CleanBucketName}/${CleanPrefix}
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRON_SCHEDULE
+      Schedule:
+        ScheduleExpression: !Ref CrawlerScheduleExpression
+      Configuration: |
+        {
+          "Version": 1.0,
+          "Grouping": { "TableLevelConfiguration": 3 }
+        }
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Ref GlueJobName
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: "4.0"
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${CodeBucketName}/${GlueScriptKey}
+        PythonVersion: "3"
+      DefaultArguments:
+        --job-language: python
+        --enable-continuous-cloudwatch-log: "true"
+        --enable-metrics: "true"
+        --raw_bucket: !Ref RawBucketName
+        --raw_prefix: !Ref RawPrefix
+        --clean_bucket: !Ref CleanBucketName
+        --clean_prefix: !Ref CleanPrefix
+
+  # -----------------------------
+  # Athena WorkGroup
+  # -----------------------------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref AthenaWorkGroupName
+      Description: !Sub "WorkGroup for ${ProjectName}"
+      State: ENABLED
+      WorkGroupConfiguration:
+        BytesScannedCutoffPerQuery: 0
+        EnforceWorkGroupConfiguration: false
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${AthenaResultsBucketName}/results/
+
+Outputs:
+  RawBucketOut:
+    Description: RAW ingest bucket
+    Value: !Ref RawBucketName
+    Export:
+      Name: !Sub ${AWS::StackName}-RawBucketName
+  CleanBucketOut:
+    Description: CLEAN curated bucket
+    Value: !Ref CleanBucketName
+    Export:
+      Name: !Sub ${AWS::StackName}-CleanBucketName
+  AthenaResultsBucketOut:
+    Description: Athena results bucket
+    Value: !Ref AthenaResultsBucketName
+  LambdaNameOut:
+    Description: Lambda function name
+    Value: !Ref DataCleanLambda
+  GlueDatabaseOut:
+    Description: Glue database name
+    Value: !Ref GlueDatabaseName
+  GlueCrawlerOut:
+    Description: Glue crawler name
+    Value: !Ref GlueCrawlerName
+  GlueJobOut:
+    Description: Glue job name
+    Value: !Ref GlueJobName
+  AthenaWorkGroupOut:
+    Description: Athena WorkGroup
+    Value: !Ref AthenaWorkGroupName
